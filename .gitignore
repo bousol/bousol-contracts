@@ -1,0 +1,49 @@
+# Rust's output directory
+target/
+
+# Cargo lock is kept for workspace root
+# (remove this line if you want to ignore it)
+
+# Local Soroban settings
+.soroban/
+
+# Local Stellar identities/keys (do not commit)
+.stellar/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# IDEs & editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Bare git repos created locally (e.g. for clean exports)
+*.git/
+
+# Claude Code project settings
+.claude/
+
+# Wasm build artifacts
+*.wasm
+*.optimized.wasm
