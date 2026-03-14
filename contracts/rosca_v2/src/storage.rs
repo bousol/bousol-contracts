@@ -21,6 +21,9 @@ pub enum DataKey {
     // Statistics
     Statistics,
 
+    // Sponsorship
+    Sponsor(Address),          // Sponsor record for a candidate address
+
     // Governance
     ProposalCounter,           // u64 - auto-increment counter
     Proposal(u64),             // Proposal by ID

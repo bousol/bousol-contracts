@@ -47,3 +47,6 @@ Desktop.ini
 # Wasm build artifacts
 *.wasm
 *.optimized.wasm
+
+# Soroban test snapshots (auto-generated)
+**/test_snapshots/

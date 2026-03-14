@@ -113,6 +113,9 @@ pub struct Member {
     // === State control ===
     pub cooldown_until_round: u64,      // Cooldown ends at this round
     pub violation_lockout_until: u64,   // Violation lockout ends at this round
+
+    // === Sponsorship ===
+    pub sponsored_by: Option<Address>,  // Who sponsored this member (audit trail)
 }
 
 impl Member {
@@ -243,7 +246,7 @@ pub struct EmergencyPayoutDetails {
 #[contracttype]
 pub enum ProposalType {
     EmergencyPayout(EmergencyPayoutDetails),  // Emergency payout (>66%, 48h)
-    UpdateConfig,                             // Config changes (>50%, 7d + 7d cooldown)
+    UpdateConfig(RoscaConfig),                // Config changes (>50%, 7d + 7d cooldown)
     Dissolution(DissolutionMode),             // Dissolution: Emergency (>75%, 24h) or Normal (>90%, 14d)
 }
 
