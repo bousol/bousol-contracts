@@ -8,7 +8,7 @@ use errors::Error;
 use storage::{DataKey, PersistentDataKey, TempDataKey};
 use types::*;
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, Vec};
 
 #[contract]
 pub struct RoscaV2Contract;
@@ -64,6 +64,23 @@ impl RoscaV2Contract {
             total_violations: 0,
         };
         env.storage().instance().set(&DataKey::Statistics, &stats);
+
+        Ok(())
+    }
+
+    /// Upgrade contract WASM code (admin only)
+    /// Contract address and all storage data are preserved.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let admin: Address = env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+        // Extend TTL after upgrade to ensure contract stays alive
+        Self::extend_instance_ttl(&env);
 
         Ok(())
     }
