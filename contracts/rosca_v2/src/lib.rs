@@ -5,7 +5,7 @@ mod storage;
 mod types;
 
 use errors::Error;
-use storage::DataKey;
+use storage::{DataKey, PersistentDataKey, TempDataKey};
 use types::*;
 
 use soroban_sdk::{contract, contractimpl, token, Address, Env, Vec};
@@ -16,7 +16,9 @@ pub struct RoscaV2Contract;
 #[contractimpl]
 impl RoscaV2Contract {
     /// Initialize the contract
-    pub fn initialize(env: Env, config: RoscaConfig) -> Result<(), Error> {
+    pub fn initialize(env: Env, admin: Address, config: RoscaConfig) -> Result<(), Error> {
+        admin.require_auth();
+
         // Check if already initialized
         if env.storage().instance().has(&DataKey::Config) {
             return Err(Error::AlreadyInitialized);
@@ -24,6 +26,9 @@ impl RoscaV2Contract {
 
         // Validate configuration
         Self::validate_config(&config)?;
+
+        // Store admin
+        env.storage().instance().set(&DataKey::Admin, &admin);
 
         // Store configuration
         env.storage().instance().set(&DataKey::Config, &config);
@@ -37,6 +42,16 @@ impl RoscaV2Contract {
         env.storage()
             .instance()
             .set(&DataKey::MembersList, &Vec::<Address>::new(&env));
+
+        // Initialize proposal counter
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCounter, &0u64);
+
+        // Initialize per-round insurance tracking
+        env.storage()
+            .instance()
+            .set(&DataKey::RoundInsurance, &0i128);
 
         // Initialize statistics
         let stats = Statistics {
@@ -101,11 +116,11 @@ impl RoscaV2Contract {
             .ok_or(Error::NotInitialized)
     }
 
-    /// Get round information
+    /// Get round information (C2: from persistent storage)
     pub fn get_round(env: Env, round_id: u64) -> Result<Round, Error> {
         env.storage()
-            .instance()
-            .get(&DataKey::Round(round_id))
+            .persistent()
+            .get(&PersistentDataKey::Round(round_id))
             .ok_or(Error::InvalidState)
     }
 
@@ -131,16 +146,23 @@ impl RoscaV2Contract {
         let mut insurance_distributed = 0i128;
         if insurance_pool > 0 && active_count > 0 {
             let share = insurance_pool / active_count as i128;
+            // C-02 fix: cap each transfer at the actual remaining contract balance
+            // to prevent panic if bookkeeping insurance_pool exceeds real balance
+            let mut remaining = contract_balance;
             if share > 0 {
                 for member_addr in members.iter() {
                     let member = Self::get_member(env.clone(), member_addr.clone())?;
                     if member.status == MemberStatus::Active {
-                        token_client.transfer(
-                            &env.current_contract_address(),
-                            &member_addr,
-                            &share
-                        );
-                        insurance_distributed += share;
+                        let safe_share = share.min(remaining);
+                        if safe_share > 0 {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &member_addr,
+                                &safe_share
+                            );
+                            insurance_distributed += safe_share;
+                            remaining -= safe_share;
+                        }
                     }
                 }
             }
@@ -191,6 +213,12 @@ impl RoscaV2Contract {
         config.status = RoscaStatus::Dissolved;
         env.storage().instance().set(&DataKey::Config, &config);
 
+        // H4: Emit dissolution event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("rosca"), soroban_sdk::symbol_short!("dissolve")),
+            env.ledger().timestamp(),
+        );
+
         Ok(())
     }
 
@@ -200,9 +228,9 @@ impl RoscaV2Contract {
 
         let config = Self::get_config(env.clone())?;
 
-        // Check ROSCA status
-        if config.status != RoscaStatus::Active {
-            return Err(Error::RoscaNotActive);
+        // Check ROSCA status — allow proposing when Active or Paused (reject Dissolved)
+        if config.status == RoscaStatus::Dissolved {
+            return Err(Error::RoscaDissolved);
         }
 
         // Check proposer is an active member
@@ -231,6 +259,20 @@ impl RoscaV2Contract {
                 DissolutionMode::Emergency => (24 * 3600, None),  // 24 hours
                 DissolutionMode::Normal => (14 * 24 * 3600, None), // 14 days
             },
+            ProposalType::Pause => {
+                // Cannot pause if already Paused
+                if config.status == RoscaStatus::Paused {
+                    return Err(Error::RoscaPaused);
+                }
+                (48 * 3600, None)  // 48 hours, no cooldown
+            },
+            ProposalType::Resume => {
+                // Cannot resume if not Paused
+                if config.status != RoscaStatus::Paused {
+                    return Err(Error::NotPaused);
+                }
+                (48 * 3600, None)  // 48 hours, no cooldown
+            },
         };
 
         let proposal = Proposal {
@@ -245,15 +287,22 @@ impl RoscaV2Contract {
             cooldown_ends_at: cooldown_duration.map(|d| current_time + voting_duration + d),
         };
 
-        // Store proposal
+        // C2: Store proposal in persistent storage
         env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+            .persistent()
+            .set(&PersistentDataKey::Proposal(proposal_id), &proposal);
+        Self::extend_persistent_ttl(&env, &PersistentDataKey::Proposal(proposal_id));
 
         // Increment proposal counter
         env.storage()
             .instance()
             .set(&DataKey::ProposalCounter, &(proposal_id + 1));
+
+        // H4: Emit proposal created event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("proposal"), soroban_sdk::symbol_short!("created")),
+            proposal_id,
+        );
 
         Ok(proposal_id)
     }
@@ -264,9 +313,9 @@ impl RoscaV2Contract {
 
         let config = Self::get_config(env.clone())?;
 
-        // Check ROSCA status
-        if config.status != RoscaStatus::Active {
-            return Err(Error::RoscaNotActive);
+        // Check ROSCA status — allow voting when Active or Paused (reject Dissolved)
+        if config.status == RoscaStatus::Dissolved {
+            return Err(Error::RoscaDissolved);
         }
 
         // Check voter is an active member
@@ -275,10 +324,10 @@ impl RoscaV2Contract {
             return Err(Error::MemberNotActive);
         }
 
-        // Get proposal
+        // C2: Get proposal from persistent storage
         let mut proposal = env.storage()
-            .instance()
-            .get::<DataKey, Proposal>(&DataKey::Proposal(proposal_id))
+            .persistent()
+            .get::<PersistentDataKey, Proposal>(&PersistentDataKey::Proposal(proposal_id))
             .ok_or(Error::ProposalNotFound)?;
 
         // Check if proposal is already executed
@@ -292,8 +341,8 @@ impl RoscaV2Contract {
             return Err(Error::VotingPeriodEnded);
         }
 
-        // Check if already voted
-        if env.storage().instance().has(&DataKey::Vote(proposal_id, voter.clone())) {
+        // C2: Check if already voted (persistent storage)
+        if env.storage().persistent().has(&PersistentDataKey::Vote(proposal_id, voter.clone())) {
             return Err(Error::AlreadyVoted);
         }
 
@@ -309,10 +358,11 @@ impl RoscaV2Contract {
             voted_at: current_time,
         };
 
-        // Store vote
+        // C2: Store vote in persistent storage
         env.storage()
-            .instance()
-            .set(&DataKey::Vote(proposal_id, voter.clone()), &vote);
+            .persistent()
+            .set(&PersistentDataKey::Vote(proposal_id, voter.clone()), &vote);
+        Self::extend_persistent_ttl(&env, &PersistentDataKey::Vote(proposal_id, voter.clone()));
 
         // Update proposal vote counts
         match choice {
@@ -321,8 +371,15 @@ impl RoscaV2Contract {
         }
 
         env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+            .persistent()
+            .set(&PersistentDataKey::Proposal(proposal_id), &proposal);
+        Self::extend_persistent_ttl(&env, &PersistentDataKey::Proposal(proposal_id));
+
+        // H4: Emit vote cast event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("vote"), soroban_sdk::symbol_short!("cast")),
+            (proposal_id, voter),
+        );
 
         Ok(())
     }
@@ -333,7 +390,7 @@ impl RoscaV2Contract {
 
         let config = Self::get_config(env.clone())?;
 
-        // Check ROSCA status (allow execution even if paused for dissolution)
+        // Check ROSCA status (allow execution even for dissolution)
         if config.status == RoscaStatus::Dissolved {
             return Err(Error::RoscaDissolved);
         }
@@ -344,10 +401,10 @@ impl RoscaV2Contract {
             return Err(Error::MemberNotActive);
         }
 
-        // Get proposal
+        // C2: Get proposal from persistent storage
         let mut proposal = env.storage()
-            .instance()
-            .get::<DataKey, Proposal>(&DataKey::Proposal(proposal_id))
+            .persistent()
+            .get::<PersistentDataKey, Proposal>(&PersistentDataKey::Proposal(proposal_id))
             .ok_or(Error::ProposalNotFound)?;
 
         // Check if already executed
@@ -378,6 +435,13 @@ impl RoscaV2Contract {
             }
         }
 
+        // H-03 fix: if total_voting_weight is 0 (no member has ever contributed),
+        // no proposal can pass (0 > 0 is always false). Rather than silently deadlocking,
+        // return an explicit error. Members must contribute at least once before governance works.
+        if total_voting_weight == 0 {
+            return Err(Error::InsufficientVotes);
+        }
+
         // Check if proposal passes based on type
         let passes = match &proposal.proposal_type {
             ProposalType::EmergencyPayout(_) => {
@@ -399,6 +463,14 @@ impl RoscaV2Contract {
                         (proposal.votes_for_weight as u64) * 100 > (total_voting_weight as u64) * 90
                     },
                 }
+            },
+            ProposalType::Pause => {
+                // >66% approval required (same as EmergencyPayout — serious action)
+                (proposal.votes_for_weight as u64) * 100 > (total_voting_weight as u64) * 66
+            },
+            ProposalType::Resume => {
+                // >50% approval required
+                (proposal.votes_for_weight as u64) * 100 > (total_voting_weight as u64) * 50
             },
         };
 
@@ -469,6 +541,10 @@ impl RoscaV2Contract {
                 let mut final_config = new_config.clone();
                 final_config.status = config.status;
 
+                // M1: Note — max_violations changes can retroactively kick members.
+                // This is an intentional governance power: members voted for this config change.
+                // The governance threshold (>50%) provides sufficient protection.
+
                 // Replace stored configuration
                 env.storage().instance().set(&DataKey::Config, &final_config);
             },
@@ -476,30 +552,98 @@ impl RoscaV2Contract {
                 // Execute dissolution
                 Self::dissolve_internal(env.clone())?;
             },
+            ProposalType::Pause => {
+                // Cannot pause if already Paused or Dissolved
+                if config.status == RoscaStatus::Paused {
+                    return Err(Error::RoscaPaused);
+                }
+                if config.status == RoscaStatus::Dissolved {
+                    return Err(Error::RoscaDissolved);
+                }
+
+                // Set status to Paused
+                let mut config = config.clone();
+                config.status = RoscaStatus::Paused;
+                env.storage().instance().set(&DataKey::Config, &config);
+
+                // Record pause timestamp
+                env.storage().instance().set(&DataKey::PauseTime, &env.ledger().timestamp());
+
+                // Emit pause event
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("rosca"), soroban_sdk::symbol_short!("paused")),
+                    env.ledger().timestamp(),
+                );
+            },
+            ProposalType::Resume => {
+                // Can only resume when Paused
+                if config.status == RoscaStatus::Dissolved {
+                    return Err(Error::RoscaDissolved);
+                }
+                if config.status != RoscaStatus::Paused {
+                    return Err(Error::NotPaused);
+                }
+
+                // Adjust StartTime to account for pause duration
+                let pause_time: u64 = env.storage()
+                    .instance()
+                    .get(&DataKey::PauseTime)
+                    .ok_or(Error::InvalidState)?;
+                let current_time = env.ledger().timestamp();
+                let pause_duration = current_time - pause_time;
+
+                let start_time: u64 = env.storage()
+                    .instance()
+                    .get(&DataKey::StartTime)
+                    .ok_or(Error::NotInitialized)?;
+                let new_start_time = start_time + pause_duration;
+                env.storage().instance().set(&DataKey::StartTime, &new_start_time);
+
+                // Set status to Active
+                let mut config = config.clone();
+                config.status = RoscaStatus::Active;
+                env.storage().instance().set(&DataKey::Config, &config);
+
+                // Remove PauseTime
+                env.storage().instance().remove(&DataKey::PauseTime);
+
+                // Emit resume event
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("rosca"), soroban_sdk::symbol_short!("resumed")),
+                    env.ledger().timestamp(),
+                );
+            },
         }
 
         // Mark proposal as executed
         proposal.executed = true;
         env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+            .persistent()
+            .set(&PersistentDataKey::Proposal(proposal_id), &proposal);
+        Self::extend_persistent_ttl(&env, &PersistentDataKey::Proposal(proposal_id));
+
+        // H4: Emit proposal executed event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("proposal"), soroban_sdk::symbol_short!("exec")),
+            proposal_id,
+        );
 
         Ok(())
     }
 
-    /// Get proposal information
+    /// Get proposal information (C2: from persistent storage)
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, Error> {
         env.storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
+            .persistent()
+            .get(&PersistentDataKey::Proposal(proposal_id))
             .ok_or(Error::ProposalNotFound)
     }
 
-    /// Get vote record
+    /// Get vote record (C2: from persistent storage)
     pub fn get_vote(env: Env, proposal_id: u64, voter: Address) -> Result<Vote, Error> {
         env.storage()
-            .instance()
-            .get(&DataKey::Vote(proposal_id, voter))
+            .persistent()
+            .get(&PersistentDataKey::Vote(proposal_id, voter))
             .ok_or(Error::InvalidState)
     }
 
@@ -510,6 +654,9 @@ impl RoscaV2Contract {
         let config: RoscaConfig = Self::get_config(env.clone())?;
 
         // Check ROSCA status
+        if config.status == RoscaStatus::Paused {
+            return Err(Error::RoscaPaused);
+        }
         if config.status != RoscaStatus::Active {
             return Err(Error::RoscaNotActive);
         }
@@ -519,25 +666,31 @@ impl RoscaV2Contract {
             return Err(Error::JoinNotAllowed);
         }
 
+        // Check if group is full
+        let members = Self::get_members(env.clone())?;
+        if members.len() >= config.max_members {
+            return Err(Error::GroupFull);
+        }
+
         // Check if member already exists
         if env.storage().instance().has(&DataKey::Member(member.clone())) {
             return Err(Error::MemberAlreadyExists);
         }
 
-        // Check sponsor requirement and read sponsor address
+        // Check sponsor requirement and read sponsor address (C2: from temporary storage)
         let sponsored_by: Option<Address> = if config.require_sponsor {
-            let sponsor: Address = env.storage().instance()
-                .get(&DataKey::Sponsor(member.clone()))
+            let sponsor: Address = env.storage().temporary()
+                .get(&TempDataKey::Sponsor(member.clone()))
                 .ok_or(Error::SponsorRequired)?;
             // Clean up temporary sponsor record (audit trail stored in Member)
-            env.storage().instance().remove(&DataKey::Sponsor(member.clone()));
+            env.storage().temporary().remove(&TempDataKey::Sponsor(member.clone()));
             Some(sponsor)
         } else {
             // Even without require_sponsor, check if a voluntary sponsor record exists
-            let sponsor: Option<Address> = env.storage().instance()
-                .get(&DataKey::Sponsor(member.clone()));
+            let sponsor: Option<Address> = env.storage().temporary()
+                .get(&TempDataKey::Sponsor(member.clone()));
             if sponsor.is_some() {
-                env.storage().instance().remove(&DataKey::Sponsor(member.clone()));
+                env.storage().temporary().remove(&TempDataKey::Sponsor(member.clone()));
             }
             sponsor
         };
@@ -546,9 +699,10 @@ impl RoscaV2Contract {
         if deposit_amount < config.min_deposit {
             return Err(Error::InsufficientDeposit);
         }
+        // ExceedsMaxDeposit: use correct error for exceeding max
         if let Some(max_deposit) = config.max_deposit {
             if deposit_amount > max_deposit {
-                return Err(Error::InsufficientDeposit);
+                return Err(Error::ExceedsMaxDeposit);
             }
         }
 
@@ -571,8 +725,8 @@ impl RoscaV2Contract {
             late_count: 0,
             on_time_streak: 0,
             observation_count: 0,
-            last_contribution_round: u64::MAX, // Never contributed yet
-            last_received_round: u64::MAX,     // Never received yet
+            last_contribution_round: u64::MAX, // M3: Sentinel — never contributed yet. Only used in == comparison, safe.
+            last_received_round: u64::MAX,     // M3: Sentinel — never received yet. Only used in == comparison, safe.
             cooldown_until_round: 0,
             violation_lockout_until: 0,
             sponsored_by,
@@ -583,8 +737,8 @@ impl RoscaV2Contract {
             .instance()
             .set(&DataKey::Member(member.clone()), &new_member);
 
-        // Add to members list
-        let mut members: Vec<Address> = Self::get_members(env.clone())?;
+        // Add to members list (reuse the members list fetched earlier for max_members check)
+        let mut members = members;
         members.push_back(member.clone());
         env.storage().instance().set(&DataKey::MembersList, &members);
 
@@ -600,6 +754,12 @@ impl RoscaV2Contract {
         let token_client = token::Client::new(&env, &config.token_address);
         token_client.transfer(&member, &env.current_contract_address(), &deposit_amount);
 
+        // H4: Emit member joined event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("member"), soroban_sdk::symbol_short!("joined")),
+            member,
+        );
+
         Ok(())
     }
 
@@ -609,6 +769,9 @@ impl RoscaV2Contract {
 
         let config = Self::get_config(env.clone())?;
 
+        if config.status == RoscaStatus::Paused {
+            return Err(Error::RoscaPaused);
+        }
         if config.status != RoscaStatus::Active {
             return Err(Error::RoscaNotActive);
         }
@@ -624,15 +787,29 @@ impl RoscaV2Contract {
             return Err(Error::MemberAlreadyExists);
         }
 
-        // Store sponsor record
+        // M5: Check if sponsor record already exists — prevent silent overwrite
+        if env.storage().temporary().has(&TempDataKey::Sponsor(candidate.clone())) {
+            return Err(Error::SponsorAlreadyExists);
+        }
+
+        // C2: Store sponsor record in temporary storage (auto-expires)
+        let sponsor_key = TempDataKey::Sponsor(candidate);
         env.storage()
-            .instance()
-            .set(&DataKey::Sponsor(candidate), &sponsor);
+            .temporary()
+            .set(&sponsor_key, &sponsor);
+        // TTL for sponsor records: ~7 days
+        const WEEK_IN_LEDGERS: u32 = 120_960;
+        env.storage()
+            .temporary()
+            .extend_ttl(&sponsor_key, WEEK_IN_LEDGERS / 2, WEEK_IN_LEDGERS);
 
         Ok(())
     }
 
     /// Top up deposit (replenish after violation deductions)
+    /// NOTE: Intentionally allows top-up during Paused status. This is by design — members
+    /// should be able to replenish their deposit (e.g. after violation deductions) even while
+    /// the ROSCA is paused, so they are ready when it resumes. Only Dissolved is blocked.
     pub fn top_up_deposit(env: Env, member: Address, amount: i128) -> Result<(), Error> {
         member.require_auth();
 
@@ -654,10 +831,10 @@ impl RoscaV2Contract {
             return Err(Error::InvalidContributionAmount);
         }
 
-        // Check max deposit limit
+        // Check max deposit limit — use ExceedsMaxDeposit error
         if let Some(max_deposit) = config.max_deposit {
             if member_data.deposit + amount > max_deposit {
-                return Err(Error::InsufficientDeposit); // exceeds max deposit
+                return Err(Error::ExceedsMaxDeposit);
             }
         }
 
@@ -678,6 +855,13 @@ impl RoscaV2Contract {
     pub fn request_exit(env: Env, member: Address) -> Result<(), Error> {
         member.require_auth();
 
+        // H-04 fix: block exit requests when ROSCA is dissolved (members already refunded).
+        // Exit during Paused is intentionally allowed (members may want to leave a paused group).
+        let config = Self::get_config(env.clone())?;
+        if config.status == RoscaStatus::Dissolved {
+            return Err(Error::RoscaDissolved);
+        }
+
         let mut member_data = Self::get_member(env.clone(), member.clone())?;
 
         // Only Active or Observing members can request exit
@@ -697,13 +881,19 @@ impl RoscaV2Contract {
         member_data.status = MemberStatus::ExitPending;
         env.storage()
             .instance()
-            .set(&DataKey::Member(member), &member_data);
+            .set(&DataKey::Member(member.clone()), &member_data);
 
         if was_active {
             let mut stats = Self::get_statistics(env.clone())?;
             stats.active_members = stats.active_members.saturating_sub(1);
             env.storage().instance().set(&DataKey::Statistics, &stats);
         }
+
+        // H4: Emit member exited event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("member"), soroban_sdk::symbol_short!("exit")),
+            member,
+        );
 
         Ok(())
     }
@@ -715,6 +905,9 @@ impl RoscaV2Contract {
         let config = Self::get_config(env.clone())?;
 
         // Check ROSCA status
+        if config.status == RoscaStatus::Paused {
+            return Err(Error::RoscaPaused);
+        }
         if config.status != RoscaStatus::Active {
             return Err(Error::RoscaNotActive);
         }
@@ -750,7 +943,6 @@ impl RoscaV2Contract {
 
         // Calculate amount distribution
         let insurance_amount = (config.contribution_amount as i128 * config.insurance_rate as i128) / 100;
-        let _pool_amount = config.contribution_amount - insurance_amount;
 
         // Update member data
         member_data.total_contributed += config.contribution_amount;
@@ -774,13 +966,23 @@ impl RoscaV2Contract {
             .instance()
             .set(&DataKey::Member(member.clone()), &member_data);
 
-        // Update insurance pool (capped at max)
+        // H1: Update insurance pool (capped at max — track actual insurance added)
         let mut insurance_pool = Self::get_insurance_pool(env.clone())?;
-        insurance_pool += insurance_amount;
-        insurance_pool = insurance_pool.min(config.max_insurance_pool);
+        let actual_insurance = insurance_amount.min(config.max_insurance_pool - insurance_pool).max(0);
+        insurance_pool += actual_insurance;
         env.storage()
             .instance()
             .set(&DataKey::InsurancePool, &insurance_pool);
+
+        // H1: Track per-round actual insurance
+        let mut round_insurance: i128 = env.storage()
+            .instance()
+            .get(&DataKey::RoundInsurance)
+            .unwrap_or(0);
+        round_insurance += actual_insurance;
+        env.storage()
+            .instance()
+            .set(&DataKey::RoundInsurance, &round_insurance);
 
         // Update statistics
         let mut stats = Self::get_statistics(env.clone())?;
@@ -795,6 +997,15 @@ impl RoscaV2Contract {
         let token_client = token::Client::new(&env, &config.token_address);
         token_client.transfer(&member, &env.current_contract_address(), &config.contribution_amount);
 
+        // Extend storage TTL on every contribution
+        Self::extend_instance_ttl(&env);
+
+        // H4: Emit contribution event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("contrib"), soroban_sdk::symbol_short!("made")),
+            (member, current_round),
+        );
+
         Ok(())
     }
 
@@ -805,6 +1016,9 @@ impl RoscaV2Contract {
         let config = Self::get_config(env.clone())?;
 
         // Check ROSCA status
+        if config.status == RoscaStatus::Paused {
+            return Err(Error::RoscaPaused);
+        }
         if config.status != RoscaStatus::Active {
             return Err(Error::RoscaNotActive);
         }
@@ -876,13 +1090,24 @@ impl RoscaV2Contract {
             .instance()
             .set(&DataKey::Member(member.clone()), &member_data);
 
-        // Update insurance pool (normal insurance + late fee, capped at max)
+        // H1: Update insurance pool (normal insurance + late fee, capped at max — only track what fits)
         let mut insurance_pool = Self::get_insurance_pool(env.clone())?;
-        insurance_pool += insurance_amount + late_fee;
-        insurance_pool = insurance_pool.min(config.max_insurance_pool);
+        let total_insurance = insurance_amount + late_fee;
+        let actual_insurance = total_insurance.min(config.max_insurance_pool - insurance_pool).max(0);
+        insurance_pool += actual_insurance;
         env.storage()
             .instance()
             .set(&DataKey::InsurancePool, &insurance_pool);
+
+        // H1: Track per-round actual insurance
+        let mut round_insurance: i128 = env.storage()
+            .instance()
+            .get(&DataKey::RoundInsurance)
+            .unwrap_or(0);
+        round_insurance += actual_insurance;
+        env.storage()
+            .instance()
+            .set(&DataKey::RoundInsurance, &round_insurance);
 
         // Update statistics
         let mut stats = Self::get_statistics(env.clone())?;
@@ -897,6 +1122,12 @@ impl RoscaV2Contract {
         let token_client = token::Client::new(&env, &config.token_address);
         token_client.transfer(&member, &env.current_contract_address(), &total_amount);
 
+        // H4: Emit late contribution event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("contrib"), soroban_sdk::symbol_short!("late")),
+            (member, current_round),
+        );
+
         Ok(())
     }
 
@@ -907,11 +1138,13 @@ impl RoscaV2Contract {
         let current_round = Self::get_current_round(env.clone())?;
         let members = Self::get_members(env.clone())?;
 
-        let mut candidates: Vec<(Address, i32, u32, u64)> = Vec::new(&env);
+        let mut candidates: Vec<(Address, i64, u32, u64)> = Vec::new(&env);
+
+        // M-05 fix: compute active members count ONCE before the loop (O(n) instead of O(n^2))
+        let members_count = Self::get_active_members_count(env.clone())?;
 
         for member_addr in members.iter() {
             let member = Self::get_member(env.clone(), member_addr.clone())?;
-            let members_count = Self::get_active_members_count(env.clone())?;
 
             if member.can_receive(&env, current_round, members_count, &config) {
                 let priority = member.priority_score(members_count, &config);
@@ -930,7 +1163,7 @@ impl RoscaV2Contract {
 
         // Sort: priority (desc) -> contribution count (desc) -> joined time (asc)
         // Note: Soroban SDK Vec has no sort method; simplified to linear max search
-        let mut best: Option<(Address, i32, u32, u64)> = None;
+        let mut best: Option<(Address, i64, u32, u64)> = None;
         for candidate in candidates.iter() {
             match &best {
                 None => best = Some(candidate.clone()),
@@ -952,27 +1185,30 @@ impl RoscaV2Contract {
     }
 
     /// Weighted random recipient selection based on priority
-    /// random_seed provided by admin/backend for pseudo-random selection
+    /// Uses on-chain PRNG for secure randomness
     /// Higher priority members have higher probability of being selected
-    fn select_recipient_weighted(env: &Env, random_seed: u64) -> Result<Option<Address>, Error> {
+    fn select_recipient_weighted(env: &Env) -> Result<Option<Address>, Error> {
         let config = Self::get_config(env.clone())?;
         let current_round = Self::get_current_round(env.clone())?;
         let members = Self::get_members(env.clone())?;
 
         // Collect candidates and their weights
-        let mut candidates: Vec<(Address, u32)> = Vec::new(env);
+        // C-01 fix: use u64 for weights to avoid truncating i64 priority scores
+        let mut candidates: Vec<(Address, u64)> = Vec::new(env);
         let mut total_weight = 0u64;
+
+        // M-05 fix: compute active members count ONCE before the loop (O(n) instead of O(n^2))
+        let members_count = Self::get_active_members_count(env.clone())?;
 
         for member_addr in members.iter() {
             let member = Self::get_member(env.clone(), member_addr.clone())?;
-            let members_count = Self::get_active_members_count(env.clone())?;
 
             if member.can_receive(env, current_round, members_count, &config) {
                 let priority = member.priority_score(members_count, &config);
-                // weight = max(priority, 1), ensure each candidate has at least weight of 1
-                let weight = if priority > 0 { priority as u32 } else { 1 };
+                // can_receive requires priority > 0, so cast to u64 is safe
+                let weight = priority as u64;
                 candidates.push_back((member_addr.clone(), weight));
-                total_weight += weight as u64;
+                total_weight += weight;
             }
         }
 
@@ -980,12 +1216,12 @@ impl RoscaV2Contract {
             return Ok(None);
         }
 
-        // Use random seed for weighted random selection
-        let random_value = random_seed % total_weight;
+        // Use on-chain PRNG for secure random selection
+        let random_value = env.prng().gen_range::<u64>(0..total_weight);
         let mut accumulated_weight = 0u64;
 
         for candidate in candidates.iter() {
-            accumulated_weight += candidate.1 as u64;
+            accumulated_weight += candidate.1;
             if random_value < accumulated_weight {
                 return Ok(Some(candidate.0.clone()));
             }
@@ -996,12 +1232,15 @@ impl RoscaV2Contract {
     }
 
     /// Settle round (including recipient selection and payout)
-    /// Anyone can call this function (no authentication required)
-    /// random_seed: Random seed for weighted random recipient selection
-    pub fn settle_round(env: Env, random_seed: u64) -> Result<(), Error> {
+    /// C3: Permissionless — anyone can call after round ends + grace period
+    pub fn settle_round(env: Env) -> Result<(), Error> {
+        // C3: No admin auth required. The time check ensures it can't be called early.
         let config = Self::get_config(env.clone())?;
 
         // Check ROSCA status
+        if config.status == RoscaStatus::Paused {
+            return Err(Error::RoscaPaused);
+        }
         if config.status != RoscaStatus::Active {
             return Err(Error::RoscaNotActive);
         }
@@ -1070,6 +1309,12 @@ impl RoscaV2Contract {
                     kicked_count += 1;
                 }
                 violator.status = MemberStatus::Kicked;
+
+                // H4: Emit member kicked event
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("member"), soroban_sdk::symbol_short!("kicked")),
+                    violator_addr.clone(),
+                );
             } else {
                 // Apply progressive penalty
                 let penalty_index = (violator.violation_count - 1).min((config.violation_penalties.len() - 1) as u32);
@@ -1090,25 +1335,33 @@ impl RoscaV2Contract {
         }
 
         // 3. Weighted random selection of recipient
-        let recipient_opt = Self::select_recipient_weighted(&env, random_seed)?;
+        let recipient_opt = Self::select_recipient_weighted(&env)?;
+
+        // H1: Read actual insurance collected this round (from contribute/contribute_late)
+        let actual_round_insurance: i128 = env.storage()
+            .instance()
+            .get(&DataKey::RoundInsurance)
+            .unwrap_or(0);
 
         let (payout_amount, insurance_compensation, beneficiary_loss) = if let Some(recipient_addr) = &recipient_opt {
             let mut recipient = Self::get_member(env.clone(), recipient_addr.clone())?;
 
-            // Calculate payout amount (total after insurance fee)
-            let insurance_collected = (total_collected * config.insurance_rate as i128) / 100;
-            let pool_amount = total_collected - insurance_collected;
+            // H1: Use actual insurance collected (not theoretical rate) for pool_amount calculation
+            // This correctly handles insurance pool overflow — excess stays in payout pool
+            let pool_amount = total_collected - actual_round_insurance;
 
-            // Calculate violation loss
-            let violations_loss = (violators.len() as i128) * config.contribution_amount;
+            // C1 FIX: pool_amount already only reflects actual contributors (violators didn't contribute).
+            // The violation loss is already reflected by the fact that violators are NOT in total_collected.
+            // actual_available IS pool_amount — no double subtraction.
+            let actual_available = pool_amount;
 
-            // Ideal payout amount
-            let ideal_payout = pool_amount;
-            let actual_available = pool_amount - violations_loss;
+            // C1 FIX: ideal_full_payout = what recipient would get if ALL expected members contributed
+            let ideal_full_payout = (expected_contributors.len() as i128) * config.contribution_amount
+                * (100 - config.insurance_rate as i128) / 100;
 
-            // Calculate compensation
-            let mut compensation_needed = if actual_available < ideal_payout {
-                ideal_payout - actual_available
+            // C1 FIX: compensation_needed = gap between ideal and actual
+            let mut compensation_needed = if ideal_full_payout > actual_available {
+                ideal_full_payout - actual_available
             } else {
                 0
             };
@@ -1126,11 +1379,10 @@ impl RoscaV2Contract {
             compensation_needed -= insurance_comp;
 
             // Beneficiary bears remaining loss (not exceeding max loss rate)
-            let max_beneficiary_loss = (ideal_payout * config.max_beneficiary_loss_rate as i128) / 100;
+            let max_beneficiary_loss = (ideal_full_payout * config.max_beneficiary_loss_rate as i128) / 100;
             let beneficiary_loss_amount = compensation_needed.min(max_beneficiary_loss);
 
-            // Final payout amount (ensure non-negative: extreme scenarios with majority violators
-            // and insufficient compensation could make this negative)
+            // Final payout amount (ensure non-negative)
             let final_payout = (actual_available + deposit_comp + insurance_comp).max(0);
 
             // Update beneficiary data
@@ -1159,18 +1411,42 @@ impl RoscaV2Contract {
                 .instance()
                 .set(&DataKey::InsurancePool, &insurance_pool);
 
-            // Transfer payout to recipient
+            // Transfer payout to recipient (cap at actual contract balance to prevent bricking)
             if final_payout > 0 {
                 let token_client = token::Client::new(&env, &config.token_address);
-                token_client.transfer(&env.current_contract_address(), recipient_addr, &final_payout);
-            }
+                let contract_balance = token_client.balance(&env.current_contract_address());
+                let safe_payout = final_payout.min(contract_balance);
+                if safe_payout > 0 {
+                    token_client.transfer(&env.current_contract_address(), recipient_addr, &safe_payout);
+                }
+                // Update total_received to reflect actual payout if capped
+                if safe_payout < final_payout {
+                    recipient.total_received -= final_payout - safe_payout;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Member(recipient_addr.clone()), &recipient);
+                }
 
-            (final_payout, insurance_comp, beneficiary_loss_amount)
+                // H4: Emit payout event
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("payout"), soroban_sdk::symbol_short!("made")),
+                    (recipient_addr.clone(), safe_payout),
+                );
+
+                (safe_payout, insurance_comp, beneficiary_loss_amount)
+            } else {
+                (0, insurance_comp, beneficiary_loss_amount)
+            }
         } else {
             // No eligible recipient — insurance was already added to pool in contribute/contribute_late
 
-            // Refund to contributors (contribution amount minus insurance fee)
-            let refund_per_contributor = config.contribution_amount - (config.contribution_amount * config.insurance_rate as i128 / 100);
+            // Refund to contributors (contribution amount minus actual insurance per contributor)
+            let actual_insurance_per_contributor = if actual_contributors.len() > 0 {
+                actual_round_insurance / actual_contributors.len() as i128
+            } else {
+                0
+            };
+            let refund_per_contributor = config.contribution_amount - actual_insurance_per_contributor;
             if refund_per_contributor > 0 {
                 let token_client = token::Client::new(&env, &config.token_address);
                 for contributor_addr in actual_contributors.iter() {
@@ -1181,8 +1457,10 @@ impl RoscaV2Contract {
             (0, 0, 0)
         };
 
-        // 4. Create round record
+        // Calculate violations_loss for the record
         let violations_loss = (violators.len() as i128) * config.contribution_amount;
+
+        // 4. Create round record (C2: store in persistent storage)
         let round = Round {
             round_id: current_round,
             start_time: round_start,
@@ -1191,9 +1469,10 @@ impl RoscaV2Contract {
             actual_contributors: actual_contributors.clone(),
             violators: violators.clone(),
             total_collected,
-            insurance_collected: (total_collected * config.insurance_rate as i128) / 100,
+            insurance_collected: actual_round_insurance,
             recipient: recipient_opt,
             payout_amount,
+            actual_insurance: actual_round_insurance,
             violations_loss,
             deposit_compensation: total_deposit_compensation,
             insurance_compensation,
@@ -1201,8 +1480,9 @@ impl RoscaV2Contract {
         };
 
         env.storage()
-            .instance()
-            .set(&DataKey::Round(current_round), &round);
+            .persistent()
+            .set(&PersistentDataKey::Round(current_round), &round);
+        Self::extend_persistent_ttl(&env, &PersistentDataKey::Round(current_round));
 
         // 5. Update statistics
         let mut stats = Self::get_statistics(env.clone())?;
@@ -1212,16 +1492,21 @@ impl RoscaV2Contract {
         stats.active_members = stats.active_members.saturating_sub(kicked_count);
         env.storage().instance().set(&DataKey::Statistics, &stats);
 
-        // 6. Advance to next round
+        // 6. Advance to next round and reset per-round insurance tracking
         env.storage()
             .instance()
             .set(&DataKey::CurrentRound, &(current_round + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::RoundInsurance, &0i128);
 
-        // 7. Process ExitPending members — refund and remove (pro-rata safe)
+        // 7. Process ExitPending and Kicked members — refund exiting, remove both from list
         let updated_members = Self::get_members(env.clone())?;
         let mut exit_claims: Vec<(Address, i128)> = Vec::new(&env);
+        let mut kicked_addrs: Vec<Address> = Vec::new(&env);
         let mut remaining_members = Vec::new(&env);
         let mut total_exit_claims = 0i128;
+        let mut list_changed = false;
 
         for member_addr in updated_members.iter() {
             let m = Self::get_member(env.clone(), member_addr.clone())?;
@@ -1233,11 +1518,17 @@ impl RoscaV2Contract {
                 }
                 total_exit_claims += claim;
                 exit_claims.push_back((member_addr.clone(), claim));
+                list_changed = true;
+            } else if m.status == MemberStatus::Kicked {
+                // Kicked members: deposit already confiscated, just remove from list
+                kicked_addrs.push_back(member_addr.clone());
+                list_changed = true;
             } else {
                 remaining_members.push_back(member_addr);
             }
         }
 
+        // Process exit refunds
         if !exit_claims.is_empty() {
             let token_client = token::Client::new(&env, &config.token_address);
             let available_balance = token_client.balance(&env.current_contract_address());
@@ -1260,15 +1551,51 @@ impl RoscaV2Contract {
                 // Remove member data
                 env.storage().instance().remove(&DataKey::Member(member_addr));
             }
-
-            env.storage().instance().set(&DataKey::MembersList, &remaining_members);
-            // Note: active_members was already decremented in request_exit()
         }
+
+        // Clean up kicked member data
+        for kicked_addr in kicked_addrs.iter() {
+            env.storage().instance().remove(&DataKey::Member(kicked_addr));
+        }
+
+        // Update members list if any were removed
+        if list_changed {
+            env.storage().instance().set(&DataKey::MembersList, &remaining_members);
+        }
+
+        // Extend storage TTL on every settlement
+        Self::extend_instance_ttl(&env);
+
+        // H4: Emit round settled event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("round"), soroban_sdk::symbol_short!("settled")),
+            current_round,
+        );
 
         Ok(())
     }
 
     // === Helper functions ===
+
+    /// Extend instance TTL to prevent storage expiry
+    /// Soroban instance storage shares TTL with the contract instance.
+    /// We extend to ~30 days (ledger closes ~every 5 seconds, ~518400 ledgers/month)
+    fn extend_instance_ttl(env: &Env) {
+        const MONTH_IN_LEDGERS: u32 = 518_400;  // ~30 days
+        const THRESHOLD: u32 = MONTH_IN_LEDGERS / 2;  // Extend when < 15 days remaining
+        env.storage()
+            .instance()
+            .extend_ttl(THRESHOLD, MONTH_IN_LEDGERS);
+    }
+
+    /// C2: Extend persistent storage TTL for historical data
+    fn extend_persistent_ttl(env: &Env, key: &PersistentDataKey) {
+        const YEAR_IN_LEDGERS: u32 = 6_307_200;  // ~365 days
+        const THRESHOLD: u32 = YEAR_IN_LEDGERS / 2;
+        env.storage()
+            .persistent()
+            .extend_ttl(key, THRESHOLD, YEAR_IN_LEDGERS);
+    }
 
     /// Validate configuration
     fn validate_config(config: &RoscaConfig) -> Result<(), Error> {
@@ -1281,8 +1608,8 @@ impl RoscaV2Contract {
         if config.min_deposit <= 0 || config.min_deposit > config.recommended_deposit {
             return Err(Error::InvalidDepositRange);
         }
-        // Insurance rate must be a valid percentage (0-100)
-        if config.insurance_rate > 100 {
+        // M2: Insurance rate must be < 50% (>= 50 is economically nonsensical)
+        if config.insurance_rate >= 50 {
             return Err(Error::InvalidConfig);
         }
         // Beneficiary loss rate must be a valid percentage (0-100)
@@ -1295,8 +1622,26 @@ impl RoscaV2Contract {
                 return Err(Error::InvalidDepositRange);
             }
         }
+        // Validate recommended_deposit <= max_deposit when max_deposit is set
+        if let Some(max_deposit) = config.max_deposit {
+            if config.recommended_deposit > max_deposit {
+                return Err(Error::InvalidDepositRange);
+            }
+        }
         // violation_penalties must not be empty (used for progressive penalties in settle_round)
         if config.violation_penalties.len() == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        // M1: max_violations must be >= 1
+        if config.max_violations < 1 {
+            return Err(Error::InvalidConfig);
+        }
+        // Validate late_fee_rates is non-empty when max_late_count > 0
+        if config.max_late_count > 0 && config.late_fee_rates.len() == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        // max_members must be between 2 and 100
+        if config.max_members < 2 || config.max_members > 100 {
             return Err(Error::InvalidConfig);
         }
         Ok(())

@@ -5,7 +5,7 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 #[contracttype]
 pub enum RoscaStatus {
     Active,      // Normal operation
-    Paused,      // Paused (can be resumed)
+    Paused,      // Paused (can be resumed via Resume proposal)
     Dissolved,   // Dissolved (cannot be resumed)
 }
 
@@ -74,6 +74,9 @@ pub struct RoscaConfig {
     // Beneficiary protection
     pub max_beneficiary_loss_rate: u32, // Maximum loss rate (e.g., 10 = 10%)
 
+    // Capacity
+    pub max_members: u32,               // Maximum number of members allowed
+
     // Administration
     pub allow_join: bool,               // Whether new members can join
     pub require_sponsor: bool,          // Whether new members need a sponsor
@@ -125,27 +128,28 @@ impl Member {
     }
 
     /// Priority score (points system - count)
-    pub fn priority_score(&self, members_count: u32, config: &RoscaConfig) -> i32 {
+    /// Uses i64 internally to prevent overflow with large member counts
+    pub fn priority_score(&self, members_count: u32, config: &RoscaConfig) -> i64 {
         let violation_penalty = if self.violation_count == 0 {
-            0
+            0i64
         } else {
             // Calculate cumulative violation penalty
-            let mut total_penalty = 0i32;
+            let mut total_penalty = 0i64;
             for i in 0..self.violation_count {
                 if let Some(penalty) = config.violation_penalties.get(i as u32) {
-                    total_penalty += penalty.points_deduction as i32;
+                    total_penalty += penalty.points_deduction as i64;
                 } else {
                     // Out of range, use last configured penalty
                     if let Some(last) = config.violation_penalties.last() {
-                        total_penalty += last.points_deduction as i32;
+                        total_penalty += last.points_deduction as i64;
                     }
                 }
             }
             total_penalty
         };
 
-        self.contribution_count as i32
-            - (self.receive_count as i32 * members_count as i32)
+        self.contribution_count as i64
+            - (self.receive_count as i64 * members_count as i64)
             - violation_penalty
     }
 
@@ -174,7 +178,7 @@ impl Member {
         !self.is_system_account  // System accounts are excluded from payout
             && self.status == MemberStatus::Active
             && self.net_balance() >= 0
-            && self.priority_score(members_count, config) > 0
+            && self.priority_score(members_count, config) > 0i64
             && self.observation_count >= config.observation_contributions
             && current_round >= self.cooldown_until_round
             && current_round >= self.violation_lockout_until
@@ -204,6 +208,9 @@ pub struct Round {
     pub insurance_collected: i128,            // Insurance fee collected
     pub recipient: Option<Address>,           // Payout recipient
     pub payout_amount: i128,                  // Actual payout amount
+
+    // Actual insurance deducted from contributions this round
+    pub actual_insurance: i128,               // Actual insurance added to pool (may be less than theoretical if pool was full)
 
     // Compensation
     pub violations_loss: i128,                // Loss from violations
@@ -248,6 +255,8 @@ pub enum ProposalType {
     EmergencyPayout(EmergencyPayoutDetails),  // Emergency payout (>66%, 48h)
     UpdateConfig(RoscaConfig),                // Config changes (>50%, 7d + 7d cooldown)
     Dissolution(DissolutionMode),             // Dissolution: Emergency (>75%, 24h) or Normal (>90%, 14d)
+    Pause,                                    // Pause ROSCA (>66%, 48h)
+    Resume,                                   // Resume ROSCA (>50%, 48h)
 }
 
 /// Proposal

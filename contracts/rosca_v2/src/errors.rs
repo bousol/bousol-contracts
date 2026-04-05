@@ -70,5 +70,9 @@ pub enum Error {
 
     // Others
     Overflow = 100,
+    NotPaused = 104,
     InvalidState = 101,
+    ExceedsMaxDeposit = 102,
+    SponsorAlreadyExists = 103,
+    GroupFull = 105,
 }
