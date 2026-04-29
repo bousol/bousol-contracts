@@ -1908,3 +1908,244 @@ fn test_max_members_validation() {
     let result2 = client.try_initialize(&admin, &config2);
     assert!(result2.is_ok());
 }
+
+// =========================================================
+// New feature tests
+// =========================================================
+
+#[test]
+fn test_cancel_proposal() {
+    let (env, client, admin, token_address, token_client) = setup();
+    let config = test_config(&env, &token_address);
+    client.initialize(&admin, &config);
+
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+    token_client.mint(&member1, &10_000_000_000);
+    token_client.mint(&member2, &10_000_000_000);
+    client.join(&member1, &5_000_000_000);
+    client.join(&member2, &5_000_000_000);
+
+    // Contribute so they have voting weight
+    client.contribute(&member1);
+    client.contribute(&member2);
+
+    // Create a Pause proposal
+    let proposal_id = client.propose(&member1, &ProposalType::Pause);
+    assert_eq!(proposal_id, 0);
+
+    // Verify proposal exists and is not executed
+    let proposal = client.get_proposal(&proposal_id);
+    assert!(!proposal.executed);
+
+    // Non-proposer cannot cancel
+    let cancel_result = client.try_cancel_proposal(&member2, &proposal_id);
+    assert!(cancel_result.is_err());
+
+    // Proposer can cancel
+    client.cancel_proposal(&member1, &proposal_id);
+
+    // Cannot vote on cancelled proposal
+    let vote_result = client.try_vote(&member2, &proposal_id, &VoteChoice::For);
+    assert!(vote_result.is_err());
+
+    // Cannot cancel again
+    let cancel_again = client.try_cancel_proposal(&member1, &proposal_id);
+    assert!(cancel_again.is_err());
+
+    // Cannot execute cancelled proposal
+    env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600 + 1);
+    let exec_result = client.try_execute_proposal(&member1, &proposal_id);
+    assert!(exec_result.is_err());
+}
+
+#[test]
+fn test_process_paused_exit() {
+    let (env, client, admin, token_address, token_client) = setup();
+    let config = test_config(&env, &token_address);
+    client.initialize(&admin, &config);
+
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+    token_client.mint(&member1, &10_000_000_000);
+    token_client.mint(&member2, &10_000_000_000);
+    client.join(&member1, &5_000_000_000);
+    client.join(&member2, &5_000_000_000);
+
+    // Both contribute (so they have voting weight and positive net_balance)
+    client.contribute(&member1);
+    client.contribute(&member2);
+
+    // Propose and execute Pause
+    let proposal_id = client.propose(&member1, &ProposalType::Pause);
+    client.vote(&member1, &proposal_id, &VoteChoice::For);
+    client.vote(&member2, &proposal_id, &VoteChoice::For);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600 + 1);
+    client.execute_proposal(&member1, &proposal_id);
+
+    // Verify paused
+    let cfg = client.get_config();
+    assert_eq!(cfg.status, RoscaStatus::Paused);
+
+    // settle_round should fail
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800 + 86_400 + 1);
+    let settle_result = client.try_settle_round();
+    assert!(settle_result.is_err());
+
+    // member2 requests exit while paused
+    client.request_exit(&member2);
+    let member2_data = client.get_member(&member2);
+    assert_eq!(member2_data.status, MemberStatus::ExitPending);
+
+    // process_paused_exit should work
+    client.process_paused_exit(&member2);
+
+    // member2 should be removed
+    let members = client.get_members();
+    assert_eq!(members.len(), 1);
+    let get_result = client.try_get_member(&member2);
+    assert!(get_result.is_err());
+
+    // Stats updated
+    let stats = client.get_statistics();
+    assert_eq!(stats.total_members, 1);
+
+    // Cannot call process_paused_exit when not paused
+    // Resume first
+    let resume_id = client.propose(&member1, &ProposalType::Resume);
+    client.vote(&member1, &resume_id, &VoteChoice::For);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600 + 1);
+    client.execute_proposal(&member1, &resume_id);
+
+    // Now not paused — process_paused_exit should fail
+    let result = client.try_process_paused_exit(&member1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_total_members_decremented_on_exit_and_kick() {
+    let (env, client, admin, token_address, token_client) = setup();
+    let config = test_config(&env, &token_address);
+    client.initialize(&admin, &config);
+
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+    let member3 = Address::generate(&env);
+    token_client.mint(&member1, &10_000_000_000);
+    token_client.mint(&member2, &10_000_000_000);
+    token_client.mint(&member3, &10_000_000_000);
+    client.join(&member1, &5_000_000_000);
+    client.join(&member2, &5_000_000_000);
+    client.join(&member3, &5_000_000_000);
+
+    assert_eq!(client.get_statistics().total_members, 3);
+
+    // Round 0: all contribute
+    client.contribute(&member1);
+    client.contribute(&member2);
+    client.contribute(&member3);
+
+    // member1 requests exit
+    client.request_exit(&member1);
+
+    // Settle round 0
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800 + 86_400 + 1);
+    client.settle_round();
+
+    // total_members should be 2 (member1 exited)
+    let stats = client.get_statistics();
+    assert_eq!(stats.total_members, 2);
+
+    // Round 1: member2 contributes, member3 does NOT (violation)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    client.contribute(&member2);
+
+    // Settle round 1 — member3 gets 1st violation
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800 + 86_400);
+    client.settle_round();
+
+    // Round 2: member3 does NOT contribute again (2nd violation)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    client.contribute(&member2);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800 + 86_400);
+    client.settle_round();
+
+    // Round 3: member3 does NOT contribute (3rd violation → kicked)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    client.contribute(&member2);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800 + 86_400);
+    client.settle_round();
+
+    // total_members should be 1 (member3 kicked)
+    let stats = client.get_statistics();
+    assert_eq!(stats.total_members, 1);
+    assert_eq!(client.get_members().len(), 1);
+}
+
+#[test]
+fn test_excess_deposits_go_to_insurance_pool() {
+    let (env, client, admin, token_address, token_client) = setup();
+    let config = test_config(&env, &token_address);
+    client.initialize(&admin, &config);
+
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+    let member3 = Address::generate(&env);
+    token_client.mint(&member1, &10_000_000_000);
+    token_client.mint(&member2, &10_000_000_000);
+    token_client.mint(&member3, &10_000_000_000);
+    client.join(&member1, &5_000_000_000);
+    client.join(&member2, &5_000_000_000);
+    client.join(&member3, &5_000_000_000);
+
+    // Round 0: all contribute
+    client.contribute(&member1);
+    client.contribute(&member2);
+    client.contribute(&member3);
+
+    let pool_before = client.get_insurance_pool();
+    // pool_before = 3 * 1_000_000_000 * 2 / 100 = 60_000_000
+
+    // Settle round 0
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800 + 86_400 + 1);
+    client.settle_round();
+
+    // Round 1: member3 does NOT contribute (violation)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    client.contribute(&member1);
+    client.contribute(&member2);
+
+    let pool_after_r0 = client.get_insurance_pool();
+
+    // Settle round 1 — violation with deposit compensation
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604_800 + 86_400);
+    client.settle_round();
+
+    let pool_after_r1 = client.get_insurance_pool();
+    let round1 = client.get_round(&1);
+
+    // deposit_compensation was applied, any excess should go to insurance pool
+    // If violation_loss < deposit_deduction, excess goes to pool
+    // The insurance pool should be >= pool before settle + insurance from R1 contributions
+    // (minus any insurance_comp used for compensation)
+    assert!(pool_after_r1 >= pool_after_r0); // Pool shouldn't decrease if deposit covers shortfall
+
+    // Verify stats.insurance_pool matches actual InsurancePool
+    let stats = client.get_statistics();
+    assert_eq!(stats.insurance_pool, pool_after_r1);
+}
+
+#[test]
+fn test_grace_period_not_started_error() {
+    let (env, client, admin, token_address, token_client) = setup();
+    let config = test_config(&env, &token_address);
+    client.initialize(&admin, &config);
+
+    let member1 = Address::generate(&env);
+    token_client.mint(&member1, &10_000_000_000);
+    client.join(&member1, &5_000_000_000);
+
+    // Try contribute_late during the normal contribution period (should fail with GracePeriodNotStarted)
+    let result = client.try_contribute_late(&member1);
+    assert!(result.is_err());
+}

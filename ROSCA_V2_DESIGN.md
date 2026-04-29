@@ -548,7 +548,9 @@ pub is_system_account: bool,  // Backend service account
 
 ### 3.1 Overview
 
-ROSCA V2 uses a decentralized governance model. There is **no admin** with unilateral control. All significant changes require member voting through proposals.
+ROSCA V2 uses a decentralized governance model. There is **no group admin** with unilateral control over ROSCA operations. All significant changes require member voting through proposals.
+
+**Note on contract upgrade:** The `upgrade()` function is controlled by the **contract deployer** (developer), not the ROSCA group. This is separate from ROSCA governance and is used for bug fixes and feature updates. The developer admin cannot modify ROSCA state, access funds, or bypass governance.
 
 ### 3.2 Proposal Types
 
@@ -558,6 +560,8 @@ ROSCA V2 uses a decentralized governance model. There is **no admin** with unila
 | `UpdateConfig(new_config)` | >50% | 7 days | 7 days | Change contribution amount, fees, etc. |
 | `Dissolution(Emergency)` | >75% | 24 hours | None | Critical emergency dissolution |
 | `Dissolution(Normal)` | >90% | 14 days | None | Orderly wind-down |
+| `Pause` | >66% | 48 hours | None | Pause the ROSCA (halts rounds) |
+| `Resume` | >50% | 48 hours | None | Resume a paused ROSCA |
 
 ### 3.3 Proposal Lifecycle
 
@@ -565,6 +569,7 @@ ROSCA V2 uses a decentralized governance model. There is **no admin** with unila
 1. Active member calls propose(proposer, proposal_type)
    → Creates Proposal with voting_ends_at and optional cooldown_ends_at
    → Returns proposal_id
+   → Proposer may cancel before voting period ends via cancel_proposal()
 
 2. Active members call vote(voter, proposal_id, choice)
    → choice: For or Against
@@ -726,7 +731,7 @@ enum CooldownType {
 
 enum RoscaStatus {
     Active,     // Normal operation
-    Paused,     // Paused (can be resumed via UpdateConfig proposal)
+    Paused,     // Paused via Pause proposal (can be resumed via Resume proposal)
     Dissolved,  // Dissolved (terminal state)
 }
 ```
@@ -853,12 +858,16 @@ struct Proposal {
     votes_against_weight: u32,      // total weight of "Against" votes
     executed: bool,
     cooldown_ends_at: Option<u64>,  // for UpdateConfig (7d cooldown after voting)
+    // Note: cancelled state is stored in a separate storage key (PersistentDataKey::ProposalCancelled)
+    // for upgrade compatibility — adding a field to Proposal would break deserialization of existing data
 }
 
 enum ProposalType {
     EmergencyPayout(EmergencyPayoutDetails),
     UpdateConfig(RoscaConfig),
     Dissolution(DissolutionMode),
+    Pause,                          // Pause ROSCA (>66%, 48h)
+    Resume,                         // Resume ROSCA (>50%, 48h)
 }
 
 struct EmergencyPayoutDetails {
@@ -926,8 +935,9 @@ enum DataKey {
 
     // Governance
     ProposalCounter,           // u64 (auto-increment)
-    Proposal(u64),             // Proposal by ID
-    Vote(u64, Address),        // Vote by (proposal_id, voter_address)
+    Proposal(u64),             // Proposal by ID (persistent storage)
+    Vote(u64, Address),        // Vote by (proposal_id, voter_address) (persistent)
+    ProposalCancelled(u64),    // bool — whether proposal is cancelled (persistent, separate from Proposal struct for upgrade compatibility)
 }
 ```
 
@@ -1034,8 +1044,9 @@ Late contribution (within round_end to round_end + grace_period):
 ### 5.4 Settlement Flow (settle_round)
 
 ```
-Anyone can call settle_round(random_seed) after round_end + grace_period:
+Anyone can call settle_round() after round_end + grace_period:
 (settle_round waits for the full grace period so members can use contribute_late)
+(Uses on-chain PRNG via env.prng() for secure random recipient selection)
 
 1. Identify expected contributors (Active + Observing members)
    - ExitPending members are NOT expected to contribute (no violation for them)
@@ -1058,29 +1069,30 @@ Anyone can call settle_round(random_seed) after round_end + grace_period:
    │   └─ Set violation_lockout_until = current_round + lockout_rounds
    └─ Save updated member
 
-4. Select recipient via weighted random:
+4. Select recipient via weighted random (on-chain PRNG):
    ├─ Filter: all members where can_receive() == true
-   ├─ Weight = max(priority_score, 1)
+   ├─ Weight = priority_score (can_receive requires > 0)
    ├─ Total weight = sum of all candidates' weights
-   ├─ random_value = random_seed % total_weight
+   ├─ random_value = env.prng().gen_range(0..total_weight)
    ├─ Walk through candidates accumulating weight
-   └─ First candidate where accumulated >= random_value wins
+   └─ First candidate where accumulated > random_value wins
 
 5. Calculate payout (if recipient found):
-   ├─ ideal_payout = total_collected - insurance_collected
-   ├─ violations_loss = violator_count × contribution_amount
-   ├─ actual_available = ideal_payout - violations_loss
-   ├─ compensation_needed = ideal_payout - actual_available
+   ├─ pool_amount = total_collected - actual_round_insurance
+   ├─ actual_available = pool_amount (violators didn't contribute, already excluded)
+   ├─ ideal_full_payout = expected_contributors × contribution_amount × (100 - insurance_rate) / 100
+   ├─ compensation_needed = max(0, ideal_full_payout - actual_available)
    │
    ├─ Step 1: Deposit compensation
    │   └─ deposit_comp = min(compensation_needed, total_deposit_deductions)
+   │   └─ Excess confiscated deposits → routed to insurance pool (capped at max)
    ├─ Step 2: Insurance compensation
    │   └─ insurance_comp = min(remaining, insurance_pool, max_insurance_coverage)
    ├─ Step 3: Beneficiary loss
-   │   └─ beneficiary_loss = min(remaining, ideal_payout × max_beneficiary_loss_rate / 100)
+   │   └─ beneficiary_loss = min(remaining, ideal_full_payout × max_beneficiary_loss_rate / 100)
    │
    ├─ final_payout = max(0, actual_available + deposit_comp + insurance_comp)
-   │   (clamped to 0 to prevent negative payout in extreme scenarios)
+   │   (clamped to actual contract balance to prevent panic)
    ├─ Transfer final_payout to recipient (if > 0)
    └─ Update recipient:
        ├─ total_received += final_payout
@@ -1095,11 +1107,12 @@ Anyone can call settle_round(random_seed) after round_end + grace_period:
 
 7. Create Round record with full breakdown
 
-8. Update Statistics (total_rounds++, total_violations, total_paid_out)
+8. Update Statistics (total_rounds++, total_violations, total_paid_out, insurance_pool synced)
 
 9. Advance round: CurrentRound += 1
 
-10. Process ExitPending members (pro-rata safe):
+10. Process ExitPending and Kicked members:
+    ├─ Decrement total_members for all removed members
     ├─ Calculate total exit claims across all ExitPending members
     ├─ Check contract token balance
     ├─ For each member with status == ExitPending:
@@ -1214,6 +1227,7 @@ pub fn get_statistics(env: Env) -> Result<Statistics, Error>
 pub fn get_round(env: Env, round_id: u64) -> Result<Round, Error>
 pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, Error>
 pub fn get_vote(env: Env, proposal_id: u64, voter: Address) -> Result<Vote, Error>
+pub fn is_cancelled(env: Env, proposal_id: u64) -> bool  // check if proposal was cancelled
 pub fn calculate_recipient(env: Env) -> Result<Option<Address>, Error>  // deterministic highest-priority (for reference)
 ```
 
@@ -1247,7 +1261,8 @@ pub fn contribute_late(env: Env, member: Address) -> Result<(), Error>
 
 ```rust
 // Settle current round (permissionless — anyone can call after round ends)
-pub fn settle_round(env: Env, random_seed: u64) -> Result<(), Error>
+// Uses on-chain PRNG (env.prng()) for secure random recipient selection
+pub fn settle_round(env: Env) -> Result<(), Error>
 ```
 
 ### 6.6 Governance
@@ -1261,6 +1276,25 @@ pub fn vote(env: Env, voter: Address, proposal_id: u64, choice: VoteChoice) -> R
 
 // Execute a passed proposal
 pub fn execute_proposal(env: Env, executor: Address, proposal_id: u64) -> Result<(), Error>
+
+// Cancel a proposal (proposer only, before voting period ends)
+pub fn cancel_proposal(env: Env, proposer: Address, proposal_id: u64) -> Result<(), Error>
+```
+
+### 6.7 Pause-State Exit
+
+```rust
+// Process exit refund while ROSCA is Paused (since settle_round cannot run)
+pub fn process_paused_exit(env: Env, member: Address) -> Result<(), Error>
+```
+
+### 6.8 Contract Upgrade
+
+```rust
+// Upgrade contract WASM code (developer admin only — not the ROSCA group admin)
+// The admin is the contract deployer, separate from ROSCA governance.
+// All storage data is preserved across upgrades.
+pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error>
 ```
 
 ---
@@ -1627,7 +1661,7 @@ If Alice misses the grace period entirely:
 
 **Background:**
 - 10-member ROSCA, Round 12
-- settle_round called with random_seed
+- settle_round called (uses on-chain PRNG)
 
 ```
 === Eligible Candidates ===
@@ -1658,7 +1692,7 @@ Eve (observation period):
 Candidates: Alice(2), Bob(1), Carol(3)
 Total weight: 6
 
-random_value = random_seed % 6
+random_value = env.prng().gen_range(0..6)
 
   0-2 → Carol  (weight 3, probability 50%)
   3-4 → Alice  (weight 2, probability 33%)
@@ -1925,7 +1959,6 @@ enum Error {
 
     // Permission errors
     Unauthorized = 10,
-    NotAdmin = 11,
 
     // Member-related errors
     MemberAlreadyExists = 20,
@@ -1935,9 +1968,6 @@ enum Error {
     CannotExit = 24,
     CannotReceive = 25,
     JoinNotAllowed = 26,
-    InObservationPeriod = 27,
-    InCooldownPeriod = 28,
-    InViolationLockout = 29,
 
     // Contribution-related errors
     AlreadyContributed = 30,
@@ -1947,10 +1977,7 @@ enum Error {
     GracePeriodEnded = 34,
 
     // Payout-related errors
-    RecipientAlreadySet = 40,
-    NoEligibleRecipient = 41,
     InsufficientFunds = 42,
-    NegativePriorityScore = 43,
     InsufficientNetBalance = 44,
 
     // Violation-related errors
@@ -1967,7 +1994,7 @@ enum Error {
     RoscaPaused = 71,
     RoscaDissolved = 72,
 
-    // Voting errors
+    // Voting/Governance errors
     ProposalNotFound = 80,
     ProposalAlreadyExecuted = 81,
     VotingPeriodNotEnded = 82,
@@ -1975,19 +2002,34 @@ enum Error {
     InsufficientVotes = 84,
     AlreadyVoted = 85,
     CooldownNotEnded = 86,
-    InvalidProposalType = 87,
+    ProposalCancelled = 87,
     SponsorRequired = 88,
-    NotSponsor = 89,
 
     // Round errors
     RoundNotEnded = 90,
-    RoundAlreadySettled = 91,
+    GracePeriodNotStarted = 91,  // contribute_late called before grace period
 
     // Others
     Overflow = 100,
     InvalidState = 101,
+    ExceedsMaxDeposit = 102,
+    SponsorAlreadyExists = 103,
+    NotPaused = 104,
+    GroupFull = 105,
 }
 ```
+
+**Error codes changed from previous version:**
+
+| Code | Old | New |
+|------|-----|-----|
+| 11 | `NotAdmin` | *removed* (unused) |
+| 27-29 | `InObservationPeriod`, `InCooldownPeriod`, `InViolationLockout` | *removed* (unused) |
+| 40-41,43 | `RecipientAlreadySet`, `NoEligibleRecipient`, `NegativePriorityScore` | *removed* (unused) |
+| 87 | `InvalidProposalType` | **`ProposalCancelled`** |
+| 89 | `NotSponsor` | *removed* (unused) |
+| 91 | `RoundAlreadySettled` | **`GracePeriodNotStarted`** |
+| 102-105 | — | **Added**: `ExceedsMaxDeposit`, `SponsorAlreadyExists`, `NotPaused`, `GroupFull` |
 
 ---
 
@@ -2012,37 +2054,20 @@ let round_end = round_start + contribution_period;
 
 **Recommended approach:** Backend scheduled task (cron every 30 seconds)
 ```javascript
-// Check if round has ended + grace period → call settle_round with random seed
+// Check if round has ended + grace period → call settle_round
 async function settleIfNeeded() {
     const currentTime = Date.now() / 1000;
     const roundEnd = startTime + (currentRound * contributionPeriod) + contributionPeriod;
     const settleAfter = roundEnd + violationGracePeriod;
     if (currentTime >= settleAfter) {
-        const seed = BigInt(currentTime) ^ BigInt(latestLedger);
-        await contract.settle_round({ random_seed: seed });
+        await contract.settle_round();
     }
 }
 ```
 
-### 10.3 Random Seed
+### 10.3 On-Chain Randomness
 
-`settle_round` accepts a `random_seed` parameter for weighted random recipient selection.
-
-**Recommended sources (ordered by security):**
-```javascript
-// 1. Multi-source combination (recommended)
-const seed = BigInt(timestamp) ^ BigInt(blockHash) ^ BigInt(nonce);
-
-// 2. Timestamp + ledger information
-const seed = Date.now() + latestLedger;
-
-// 3. External VRF service (most secure but costly)
-const seed = await chainlinkVRF.getRandomNumber();
-```
-
-**Not recommended:**
-- ❌ Simple incrementing sequence (predictable)
-- ❌ Fully controlled by a single party (manipulable)
+`settle_round` uses Soroban's on-chain PRNG (`env.prng()`) for secure weighted random recipient selection. No external random seed is needed — randomness is provided by the network.
 
 ### 10.4 Gas Optimization
 

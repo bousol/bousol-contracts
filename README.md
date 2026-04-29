@@ -119,13 +119,13 @@ CooldownType::TimeBased(secs)  // time-based
 
 #### 7. Weighted Random Payout Selection
 
-Each round, `settle_round(random_seed)` selects the recipient:
+Each round, `settle_round()` selects the recipient using on-chain PRNG (`env.prng()`):
 
 1. Filter all members who satisfy `can_receive()` (active, net_balance ≥ 0, priority > 0, observation done, not in cooldown or lockout)
-2. Assign each candidate a weight = `max(priority_score, 1)`
-3. Weighted random draw using the provided seed:
+2. Assign each candidate a weight = `priority_score` (guaranteed > 0 by `can_receive`)
+3. Weighted random draw using on-chain PRNG:
    ```
-   random_value = random_seed % total_weight
+   random_value = env.prng().gen_range(0..total_weight)
    ```
 
 Higher priority → higher probability, but not guaranteed. This gives lower-priority members a non-zero chance and prevents starvation.
@@ -141,7 +141,7 @@ Higher priority → higher probability, but not guaranteed. This gives lower-pri
 **Built-in protections:**
 - Time window: reverts if the current round has not ended yet
 - Idempotent: the round counter advances after settlement, so double-calls are safe
-- Deterministic execution: same `round_id` + `random_seed` always produces the same result
+- Uses on-chain PRNG for secure random recipient selection
 
 This design eliminates the single point of failure from an admin-only settle function.
 
@@ -151,7 +151,7 @@ This design eliminates the single point of failure from an admin-only settle fun
 
 All major decisions are made via weighted voting. Voting weight = `contribution_count` (members who contributed more have more say).
 
-Three proposal types:
+Five proposal types:
 
 | Proposal | Approval threshold | Voting period | Cooldown |
 |----------|-------------------|---------------|----------|
@@ -159,10 +159,16 @@ Three proposal types:
 | `UpdateConfig` | > 50% | 7 days | 7 days |
 | `Dissolution(Normal)` | > 90% | 14 days | — |
 | `Dissolution(Emergency)` | > 75% | 24 hours | — |
+| `Pause` | > 66% | 48 hours | — |
+| `Resume` | > 50% | 48 hours | — |
 
 **Emergency Payout** lets a member request early access to their accrued net balance (requires ≥ 66% approval). After execution the member enters the normal cooldown period.
 
 **Dissolution** refunds all members: deposit + positive net balance. The insurance pool surplus is split equally among active members.
+
+**Pause/Resume** allows the group to temporarily halt rounds (e.g., during holidays). While paused, ExitPending members can claim refunds via `process_paused_exit()`.
+
+Proposers may **cancel** their proposals before the voting period ends via `cancel_proposal()`.
 
 ---
 
@@ -170,13 +176,16 @@ Three proposal types:
 
 #### Initialization
 ```rust
-fn initialize(env: Env, config: RoscaConfig) -> Result<(), Error>
+fn initialize(env: Env, admin: Address, config: RoscaConfig) -> Result<(), Error>
 ```
 
 #### Member Management
 ```rust
 fn join(env: Env, member: Address, deposit_amount: i128) -> Result<(), Error>
-fn exit(env: Env, member: Address) -> Result<(), Error>
+fn request_exit(env: Env, member: Address) -> Result<(), Error>
+fn process_paused_exit(env: Env, member: Address) -> Result<(), Error>  // exit during Pause
+fn sponsor(env: Env, sponsor: Address, candidate: Address) -> Result<(), Error>
+fn top_up_deposit(env: Env, member: Address, amount: i128) -> Result<(), Error>
 ```
 
 #### Contributions
@@ -187,7 +196,7 @@ fn contribute_late(env: Env, member: Address) -> Result<(), Error>
 
 #### Settlement
 ```rust
-fn settle_round(env: Env, random_seed: u64) -> Result<(), Error>
+fn settle_round(env: Env) -> Result<(), Error>              // permissionless, uses on-chain PRNG
 fn calculate_recipient(env: Env) -> Result<Option<Address>, Error>  // read-only
 ```
 
@@ -195,6 +204,7 @@ fn calculate_recipient(env: Env) -> Result<Option<Address>, Error>  // read-only
 ```rust
 fn propose(env: Env, proposer: Address, proposal_type: ProposalType) -> Result<u64, Error>
 fn vote(env: Env, voter: Address, proposal_id: u64, choice: VoteChoice) -> Result<(), Error>
+fn cancel_proposal(env: Env, proposer: Address, proposal_id: u64) -> Result<(), Error>
 fn execute_proposal(env: Env, executor: Address, proposal_id: u64) -> Result<(), Error>
 ```
 
@@ -208,6 +218,7 @@ fn get_insurance_pool(env: Env) -> Result<i128, Error>
 fn get_statistics(env: Env) -> Result<Statistics, Error>
 fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, Error>
 fn get_vote(env: Env, proposal_id: u64, voter: Address) -> Result<Vote, Error>
+fn is_cancelled(env: Env, proposal_id: u64) -> bool
 ```
 
 ---
@@ -237,41 +248,135 @@ Round 5: Carol passes lockout → Dave selected again (priority score recovered)
 
 ---
 
+### Contract API (continued)
+
+#### Admin
+```rust
+fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error>  // admin only
+fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error>  // admin only, step 1
+fn accept_admin(env: Env) -> Result<(), Error>                        // pending admin only, step 2
+```
+
+Admin transfer is two-step to prevent accidental loss of upgrade capability.
+
+---
+
 ### Development
+
+**Toolchain:**
+
+| Component | Version |
+|-----------|---------|
+| Rust | 1.95+ (stable) |
+| soroban-sdk | 25.3.1 |
+| Stellar CLI | 25.2.0 |
+| Build target | `wasm32v1-none` |
 
 **Build:**
 ```bash
-cargo build --target wasm32-unknown-unknown --release
+cargo build --target wasm32v1-none --release -p rosca_v2
 ```
 
 **Run tests:**
 ```bash
-cargo test
+cargo test --package rosca_v2
 ```
 
 **Optimize WASM:**
 ```bash
 stellar contract optimize \
-  --wasm target/wasm32-unknown-unknown/release/rosca_v2.wasm
+  --wasm target/wasm32v1-none/release/rosca_v2.wasm
 ```
 
 ---
 
 ### Deployment
 
+#### Mainnet (Production)
+
+Deployed on **2026-04-28**.
+
+| Item | Value |
+|------|-------|
+| Contract ID | `CCE7TPDTAZOFGU6ZCKDEBKBWWXKO27D4I5AHKYRXC2FUNATCPRFY72CI` |
+| WASM Hash | `22e25896129abdba5d9d08d305788b0be910cd6f0b94f0843e82f75967e6329c` |
+| Deployer | `bousol-pro` (`GAWMVAGTT3HZR3RA3MQIW7P6APJWOF7KC7FTQTQL3K2BS7P4JHVLOTYL`) |
+| Admin | `rosca-admin` (`GB3K3HQG3D7RUURI3ICIEE3VQJHU6FCRC3HTW5MFYX2WKE6BGVO7PIA6`) |
+| Network | Stellar Mainnet |
+| Explorer | [stellar.expert](https://stellar.expert/explorer/public/contract/CCE7TPDTAZOFGU6ZCKDEBKBWWXKO27D4I5AHKYRXC2FUNATCPRFY72CI) |
+| Deployment cost | ~58.6 XLM |
+
+**Server environment variables:**
+```
+ROSCA_V2_CONTRACT_ID=CCE7TPDTAZOFGU6ZCKDEBKBWWXKO27D4I5AHKYRXC2FUNATCPRFY72CI
+ROSCA_V2_ADMIN_ADDRESS=GB3K3HQG3D7RUURI3ICIEE3VQJHU6FCRC3HTW5MFYX2WKE6BGVO7PIA6
+```
+
+#### Account Roles
+
+| Account | Alias | Purpose | Security |
+|---------|-------|---------|----------|
+| `GAWMVAGTT3...` | `bousol-pro` | Deployed the WASM | Medium (no ongoing role) |
+| `GB3K3HQG3D...` | `rosca-admin` | Contract admin (upgrade only) | High (cold wallet, offline) |
+| `FEE_ACCOUNT_SEED` | — | Server gas payer, settle_round caller | Medium (on server) |
+
+#### Upgrade Procedure
+
+```bash
+# 1. Build and optimize new WASM
+cargo build --target wasm32v1-none --release -p rosca_v2
+stellar contract optimize --wasm target/wasm32v1-none/release/rosca_v2.wasm
+
+# 2. Upload new WASM (get hash)
+stellar contract install \
+  --wasm target/wasm32v1-none/release/rosca_v2.optimized.wasm \
+  --source rosca-admin \
+  --network mainnet
+
+# 3. Call upgrade with the new hash
+stellar contract invoke \
+  --id CCE7TPDTAZOFGU6ZCKDEBKBWWXKO27D4I5AHKYRXC2FUNATCPRFY72CI \
+  --source rosca-admin \
+  --network mainnet \
+  -- upgrade \
+  --new_wasm_hash <NEW_HASH>
+```
+
+#### Admin Transfer Procedure (two-step)
+
+```bash
+# Step 1: Current admin proposes new admin
+stellar contract invoke \
+  --id CCE7TPDTAZOFGU6ZCKDEBKBWWXKO27D4I5AHKYRXC2FUNATCPRFY72CI \
+  --source rosca-admin \
+  --network mainnet \
+  -- transfer_admin \
+  --new_admin <NEW_ADMIN_ADDRESS>
+
+# Step 2: New admin accepts
+stellar contract invoke \
+  --id CCE7TPDTAZOFGU6ZCKDEBKBWWXKO27D4I5AHKYRXC2FUNATCPRFY72CI \
+  --source <NEW_ADMIN_KEY> \
+  --network mainnet \
+  -- accept_admin
+```
+
+#### Testnet
+
 ```bash
 # Deploy
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/rosca_v2.wasm \
-  --source YOUR_SECRET_KEY \
+  --wasm target/wasm32v1-none/release/rosca_v2.optimized.wasm \
+  --source alice \
   --network testnet
 
 # Initialize
 stellar contract invoke \
-  --id CONTRACT_ID \
-  --source YOUR_SECRET_KEY \
+  --id <CONTRACT_ID> \
+  --source alice \
   --network testnet \
   -- initialize \
+  --admin <ADMIN_ADDRESS> \
   --config '{...}'
 ```
 

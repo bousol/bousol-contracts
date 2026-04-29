@@ -20,7 +20,8 @@ pub enum DataKey {
     Statistics,
 
     // Admin
-    Admin,                     // Address - admin who can call settle_round
+    Admin,                     // Address - admin who can upgrade contract
+    PendingAdmin,              // Address - pending admin for two-step transfer
 
     // Governance
     ProposalCounter,           // u64 - auto-increment counter
@@ -39,6 +40,7 @@ pub enum PersistentDataKey {
     Round(u64),                // Round data by round number
     Proposal(u64),             // Proposal by ID
     Vote(u64, Address),        // Vote by proposal ID and voter address
+    ProposalCancelled(u64),    // Whether proposal is cancelled (upgrade-safe, separate from Proposal struct)
 }
 
 /// Temporary storage keys — auto-expiring data

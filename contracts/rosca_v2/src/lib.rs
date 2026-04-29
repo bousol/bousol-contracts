@@ -85,6 +85,35 @@ impl RoscaV2Contract {
         Ok(())
     }
 
+    /// Step 1: Propose admin transfer (current admin only)
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let admin: Address = env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        Self::extend_instance_ttl(&env);
+
+        Ok(())
+    }
+
+    /// Step 2: Accept admin transfer (pending admin only)
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending: Address = env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::InvalidState)?;
+        pending.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Self::extend_instance_ttl(&env);
+
+        Ok(())
+    }
+
     /// Get configuration
     pub fn get_config(env: Env) -> Result<RoscaConfig, Error> {
         env.storage()
@@ -321,6 +350,7 @@ impl RoscaV2Contract {
             proposal_id,
         );
 
+        Self::extend_instance_ttl(&env);
         Ok(proposal_id)
     }
 
@@ -347,9 +377,12 @@ impl RoscaV2Contract {
             .get::<PersistentDataKey, Proposal>(&PersistentDataKey::Proposal(proposal_id))
             .ok_or(Error::ProposalNotFound)?;
 
-        // Check if proposal is already executed
+        // Check if proposal is already executed or cancelled
         if proposal.executed {
             return Err(Error::ProposalAlreadyExecuted);
+        }
+        if Self::is_proposal_cancelled(&env, proposal_id) {
+            return Err(Error::ProposalCancelled);
         }
 
         // Check if voting period has ended
@@ -398,6 +431,7 @@ impl RoscaV2Contract {
             (proposal_id, voter),
         );
 
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -424,9 +458,12 @@ impl RoscaV2Contract {
             .get::<PersistentDataKey, Proposal>(&PersistentDataKey::Proposal(proposal_id))
             .ok_or(Error::ProposalNotFound)?;
 
-        // Check if already executed
+        // Check if already executed or cancelled
         if proposal.executed {
             return Err(Error::ProposalAlreadyExecuted);
+        }
+        if Self::is_proposal_cancelled(&env, proposal_id) {
+            return Err(Error::ProposalCancelled);
         }
 
         // Check if voting period has ended
@@ -645,6 +682,7 @@ impl RoscaV2Contract {
             proposal_id,
         );
 
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -654,6 +692,53 @@ impl RoscaV2Contract {
             .persistent()
             .get(&PersistentDataKey::Proposal(proposal_id))
             .ok_or(Error::ProposalNotFound)
+    }
+
+    /// Cancel a proposal (only the proposer can cancel, before voting period ends)
+    pub fn cancel_proposal(env: Env, proposer: Address, proposal_id: u64) -> Result<(), Error> {
+        proposer.require_auth();
+
+        let proposal = env.storage()
+            .persistent()
+            .get::<PersistentDataKey, Proposal>(&PersistentDataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        // Only the original proposer can cancel
+        if proposal.proposer != proposer {
+            return Err(Error::Unauthorized);
+        }
+
+        // Cannot cancel if already executed or cancelled
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+        if Self::is_proposal_cancelled(&env, proposal_id) {
+            return Err(Error::ProposalCancelled);
+        }
+
+        // Can only cancel before voting period ends
+        let current_time = env.ledger().timestamp();
+        if current_time > proposal.voting_ends_at {
+            return Err(Error::VotingPeriodEnded);
+        }
+
+        // Store cancelled flag in separate key (upgrade-safe: doesn't change Proposal struct)
+        let cancelled_key = PersistentDataKey::ProposalCancelled(proposal_id);
+        env.storage().persistent().set(&cancelled_key, &true);
+        Self::extend_persistent_ttl(&env, &cancelled_key);
+
+        // Emit cancellation event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("proposal"), soroban_sdk::symbol_short!("cancel")),
+            proposal_id,
+        );
+
+        Ok(())
+    }
+
+    /// Check if a proposal has been cancelled (public query)
+    pub fn is_cancelled(env: Env, proposal_id: u64) -> bool {
+        Self::is_proposal_cancelled(&env, proposal_id)
     }
 
     /// Get vote record (C2: from persistent storage)
@@ -865,6 +950,7 @@ impl RoscaV2Contract {
             .instance()
             .set(&DataKey::Member(member), &member_data);
 
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -912,6 +998,72 @@ impl RoscaV2Contract {
             member,
         );
 
+        Ok(())
+    }
+
+    /// Process exit refund while ROSCA is Paused.
+    /// During Pause, settle_round cannot run, so ExitPending members would be stuck.
+    /// This function allows any ExitPending member to claim their refund directly.
+    pub fn process_paused_exit(env: Env, member: Address) -> Result<(), Error> {
+        member.require_auth();
+
+        let config = Self::get_config(env.clone())?;
+
+        // Only allowed when Paused
+        if config.status != RoscaStatus::Paused {
+            return Err(Error::RoscaNotActive);
+        }
+
+        let member_data = Self::get_member(env.clone(), member.clone())?;
+
+        // Must be ExitPending
+        if member_data.status != MemberStatus::ExitPending {
+            return Err(Error::MemberNotActive);
+        }
+
+        // Calculate refund: deposit + max(0, net_balance)
+        let mut claim = member_data.deposit;
+        let net_balance = member_data.net_balance();
+        if net_balance > 0 {
+            claim += net_balance;
+        }
+
+        // Transfer refund (capped at contract balance)
+        if claim > 0 {
+            let token_client = token::Client::new(&env, &config.token_address);
+            let contract_balance = token_client.balance(&env.current_contract_address());
+            let refund = claim.min(contract_balance);
+            if refund > 0 {
+                token_client.transfer(&env.current_contract_address(), &member, &refund);
+            }
+        }
+
+        // Remove member from list
+        let members = Self::get_members(env.clone())?;
+        let mut new_members = Vec::new(&env);
+        for m in members.iter() {
+            if m != member {
+                new_members.push_back(m);
+            }
+        }
+        env.storage().instance().set(&DataKey::MembersList, &new_members);
+
+        // Remove member data
+        env.storage().instance().remove(&DataKey::Member(member.clone()));
+
+        // Update statistics
+        let mut stats = Self::get_statistics(env.clone())?;
+        stats.total_members = stats.total_members.saturating_sub(1);
+        // active_members was already decremented in request_exit()
+        env.storage().instance().set(&DataKey::Statistics, &stats);
+
+        // Emit event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("member"), soroban_sdk::symbol_short!("pExit")),
+            member,
+        );
+
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -1064,7 +1216,7 @@ impl RoscaV2Contract {
         let grace_period_end = period_end + config.violation_grace_period;
 
         if current_time <= period_end {
-            return Err(Error::ContributionPeriodNotStarted); // Should use normal contribute
+            return Err(Error::GracePeriodNotStarted); // Contribution period still open — use contribute() instead
         }
         if current_time > grace_period_end {
             return Err(Error::GracePeriodEnded);
@@ -1387,8 +1539,14 @@ impl RoscaV2Contract {
             let deposit_comp = compensation_needed.min(total_deposit_compensation);
             compensation_needed -= deposit_comp;
 
+            // Route excess confiscated deposits to insurance pool (prevents orphaned funds)
+            let excess_deposits = total_deposit_compensation - deposit_comp;
+
             // Compensation from insurance pool
             let mut insurance_pool = Self::get_insurance_pool(env.clone())?;
+            // Add excess confiscated deposits to insurance pool (capped at max)
+            let excess_to_pool = excess_deposits.min(config.max_insurance_pool - insurance_pool).max(0);
+            insurance_pool += excess_to_pool;
             let insurance_comp = compensation_needed
                 .min(insurance_pool)
                 .min(config.max_insurance_coverage);
@@ -1422,8 +1580,8 @@ impl RoscaV2Contract {
                 .instance()
                 .set(&DataKey::Member(recipient_addr.clone()), &recipient);
 
-            // Store updated insurance pool (insurance was already added in contribute/contribute_late;
-            // here we only subtracted insurance_comp for compensation)
+            // Store updated insurance pool (insurance added from contributions in contribute/contribute_late;
+            // excess confiscated deposits added here; insurance_comp subtracted for compensation)
             env.storage()
                 .instance()
                 .set(&DataKey::InsurancePool, &insurance_pool);
@@ -1507,6 +1665,9 @@ impl RoscaV2Contract {
         stats.total_violations += violators.len() as u32;
         stats.total_paid_out += payout_amount;
         stats.active_members = stats.active_members.saturating_sub(kicked_count);
+        // Sync insurance_pool in stats with actual InsurancePool value
+        // (may have been reduced by insurance_comp during payout compensation)
+        stats.insurance_pool = Self::get_insurance_pool(env.clone())?;
         env.storage().instance().set(&DataKey::Statistics, &stats);
 
         // 6. Advance to next round and reset per-round insurance tracking
@@ -1575,9 +1736,17 @@ impl RoscaV2Contract {
             env.storage().instance().remove(&DataKey::Member(kicked_addr));
         }
 
-        // Update members list if any were removed
+        // Update members list and total_members if any were removed
         if list_changed {
             env.storage().instance().set(&DataKey::MembersList, &remaining_members);
+
+            // Decrement total_members for removed members (exited + kicked)
+            let removed_count = exit_claims.len() + kicked_addrs.len();
+            if removed_count > 0 {
+                let mut stats = Self::get_statistics(env.clone())?;
+                stats.total_members = stats.total_members.saturating_sub(removed_count as u32);
+                env.storage().instance().set(&DataKey::Statistics, &stats);
+            }
         }
 
         // Extend storage TTL on every settlement
@@ -1612,6 +1781,14 @@ impl RoscaV2Contract {
         env.storage()
             .persistent()
             .extend_ttl(key, THRESHOLD, YEAR_IN_LEDGERS);
+    }
+
+    /// Check if a proposal is cancelled (stored in separate key for upgrade compatibility)
+    fn is_proposal_cancelled(env: &Env, proposal_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&PersistentDataKey::ProposalCancelled(proposal_id))
+            .unwrap_or(false)
     }
 
     /// Validate configuration

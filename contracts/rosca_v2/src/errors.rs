@@ -10,7 +10,6 @@ pub enum Error {
 
     // Permission errors
     Unauthorized = 10,
-    NotAdmin = 11,
 
     // Member-related errors
     MemberAlreadyExists = 20,
@@ -20,9 +19,6 @@ pub enum Error {
     CannotExit = 24,
     CannotReceive = 25,
     JoinNotAllowed = 26,
-    InObservationPeriod = 27,
-    InCooldownPeriod = 28,
-    InViolationLockout = 29,
 
     // Contribution-related errors
     AlreadyContributed = 30,
@@ -32,10 +28,7 @@ pub enum Error {
     GracePeriodEnded = 34,
 
     // Payout-related errors
-    RecipientAlreadySet = 40,
-    NoEligibleRecipient = 41,
     InsufficientFunds = 42,
-    NegativePriorityScore = 43,
     InsufficientNetBalance = 44,
 
     // Violation-related errors
@@ -60,13 +53,12 @@ pub enum Error {
     InsufficientVotes = 84,
     AlreadyVoted = 85,
     CooldownNotEnded = 86,
-    InvalidProposalType = 87,
+    ProposalCancelled = 87,
     SponsorRequired = 88,
-    NotSponsor = 89,
 
     // Round errors
     RoundNotEnded = 90,
-    RoundAlreadySettled = 91,
+    GracePeriodNotStarted = 91,  // contribute_late called before contribution period ended
 
     // Others
     Overflow = 100,
